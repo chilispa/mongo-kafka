@@ -358,12 +358,12 @@ public final class MongoSourceTask extends SourceTask {
         if (valueDocument.isPresent() || (publishFullDocumentOnly && tombstoneOnDelete)) {
 
           valueDocument.ifPresent(
-            (BsonDocument valueDoc) -> {
-              if (valueDoc instanceof RawBsonDocument) {
-                int sizeBytes = ((RawBsonDocument) valueDoc).getByteBuffer().limit();
-                currentStatistics.getMongodbBytesRead().sample(sizeBytes);
-              }
-            });
+              (BsonDocument valueDoc) -> {
+                if (valueDoc instanceof RawBsonDocument) {
+                  int sizeBytes = ((RawBsonDocument) valueDoc).getByteBuffer().limit();
+                  currentStatistics.getMongodbBytesRead().sample(sizeBytes);
+                }
+              });
 
           BsonDocument keyDocument =
               sourceConfig.getKeyOutputFormat() == OutputFormat.SCHEMA
