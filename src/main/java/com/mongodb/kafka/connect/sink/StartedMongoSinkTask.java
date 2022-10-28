@@ -23,9 +23,12 @@ import static com.mongodb.kafka.connect.util.TimeseriesValidation.validateCollec
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import org.apache.kafka.connect.connector.ConnectRecord;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
@@ -42,6 +45,9 @@ import com.mongodb.client.model.WriteModel;
 
 import com.mongodb.kafka.connect.sink.dlq.AnalyzedBatchFailedWithBulkWriteException;
 import com.mongodb.kafka.connect.sink.dlq.ErrorReporter;
+import com.mongodb.kafka.connect.util.jmx.SinkTaskStatistics;
+import com.mongodb.kafka.connect.util.jmx.Timer;
+import com.mongodb.kafka.connect.util.jmx.internal.MBeanServerUtils;
 
 public final class StartedMongoSinkTask {
   private static final Logger LOGGER = LoggerFactory.getLogger(MongoSinkTask.class);
@@ -51,6 +57,9 @@ public final class StartedMongoSinkTask {
   private final ErrorReporter errorReporter;
   private final Set<MongoNamespace> checkedTimeseriesNamespaces;
 
+  private final SinkTaskStatistics statistics;
+  private Timer lastTaskInvocation = null;
+
   StartedMongoSinkTask(
       final MongoSinkConfig sinkConfig,
       final MongoClient mongoClient,
@@ -59,21 +68,61 @@ public final class StartedMongoSinkTask {
     this.mongoClient = mongoClient;
     this.errorReporter = errorReporter;
     checkedTimeseriesNamespaces = new HashSet<>();
+    statistics = new SinkTaskStatistics(getMBeanName());
+    statistics.register();
+  }
+
+  private String getMBeanName() {
+    String id = MBeanServerUtils.taskIdFromCurrentThread();
+    return "com.mongodb.kafka.connect:type=sink-task-metrics,task=sink-task-" + id;
   }
 
   /** @see MongoSinkTask#stop() */
   void stop() {
     mongoClient.close();
+    MBeanServerUtils.unregisterMBean(getMBeanName());
   }
 
   /** @see MongoSinkTask#put(Collection) */
   void put(final Collection<SinkRecord> records) {
+    if (lastTaskInvocation != null) {
+      statistics
+          .getInConnectFramework()
+          .sample(lastTaskInvocation.getElapsedTime(TimeUnit.MILLISECONDS));
+    }
+    Timer taskTime = Timer.start();
+    statistics.getRecords().sample(records.size());
+    trackLatestRecordTimestampOffset(records);
     if (records.isEmpty()) {
       LOGGER.debug("No sink records to process for current poll operation");
-      return;
+    } else {
+      Timer processingTime = Timer.start();
+      List<List<MongoProcessedSinkRecordData>> batches =
+          MongoSinkRecordProcessor.orderedGroupByTopicAndNamespace(
+              records, sinkConfig, errorReporter);
+      statistics.getProcessingPhases().sample(processingTime.getElapsedTime(TimeUnit.MILLISECONDS));
+      for (List<MongoProcessedSinkRecordData> batch : batches) {
+        bulkWriteBatch(batch);
+      }
     }
-    MongoSinkRecordProcessor.orderedGroupByTopicAndNamespace(records, sinkConfig, errorReporter)
-        .forEach(this::bulkWriteBatch);
+    statistics.getInTaskPut().sample(taskTime.getElapsedTime(TimeUnit.MILLISECONDS));
+    lastTaskInvocation = Timer.start();
+    if (LOGGER.isDebugEnabled()) {
+      // toJSON relatively expensive
+      LOGGER.debug(statistics.getName() + ": " + statistics.toJSON());
+    }
+  }
+
+  private void trackLatestRecordTimestampOffset(final Collection<SinkRecord> records) {
+    OptionalLong latestRecord =
+        records.stream()
+            .filter(v -> v.timestamp() != null)
+            .mapToLong(ConnectRecord::timestamp)
+            .max();
+    if (latestRecord.isPresent()) {
+      long offsetMs = System.currentTimeMillis() - latestRecord.getAsLong();
+      statistics.getLatestKafkaTimeDifferenceMs().sample(offsetMs);
+    }
   }
 
   private void bulkWriteBatch(final List<MongoProcessedSinkRecordData> batch) {
@@ -91,6 +140,7 @@ public final class StartedMongoSinkTask {
             .collect(Collectors.toList());
     boolean bulkWriteOrdered = config.getBoolean(BULK_WRITE_ORDERED_CONFIG);
 
+    Timer writeTime = Timer.start();
     try {
       LOGGER.debug(
           "Bulk writing {} document(s) into collection [{}] via an {} bulk write",
@@ -102,12 +152,12 @@ public final class StartedMongoSinkTask {
               .getDatabase(namespace.getDatabaseName())
               .getCollection(namespace.getCollectionName(), BsonDocument.class)
               .bulkWrite(writeModels, new BulkWriteOptions().ordered(bulkWriteOrdered));
+      statistics.getBatchWritesSuccessful().sample(writeTime.getElapsedTime(TimeUnit.MILLISECONDS));
+      statistics.getRecordsSuccessful().sample(batch.size());
       LOGGER.debug("Mongodb bulk write result: {}", result);
-      checkRateLimit(config);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new DataException("Rate limiting was interrupted", e);
     } catch (RuntimeException e) {
+      statistics.getBatchWritesFailed().sample(writeTime.getElapsedTime(TimeUnit.MILLISECONDS));
+      statistics.getRecordsFailed().sample(batch.size());
       handleTolerableWriteException(
           batch.stream()
               .map(MongoProcessedSinkRecordData::getSinkRecord)
@@ -117,6 +167,7 @@ public final class StartedMongoSinkTask {
           config.logErrors(),
           config.tolerateErrors());
     }
+    checkRateLimit(config);
   }
 
   private void checkTimeseries(final MongoNamespace namespace, final MongoSinkTopicConfig config) {
@@ -128,18 +179,20 @@ public final class StartedMongoSinkTask {
     }
   }
 
-  private static void checkRateLimit(final MongoSinkTopicConfig config)
-      throws InterruptedException {
+  private static void checkRateLimit(final MongoSinkTopicConfig config) {
     RateLimitSettings rls = config.getRateLimitSettings();
-
     if (rls.isTriggered()) {
       LOGGER.debug(
-          "Rate limit settings triggering {}ms defer timeout after processing {}"
-              + " further batches for topic {}",
+          "Rate limit settings triggering {}ms defer timeout after processing {} further batches for topic {}",
           rls.getTimeoutMs(),
           rls.getEveryN(),
           config.getTopic());
-      Thread.sleep(rls.getTimeoutMs());
+      try {
+        Thread.sleep(rls.getTimeoutMs());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new DataException("Rate limiting was interrupted", e);
+      }
     }
   }
 

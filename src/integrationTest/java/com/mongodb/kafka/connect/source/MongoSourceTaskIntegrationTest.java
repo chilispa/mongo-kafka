@@ -21,6 +21,7 @@ import static com.mongodb.kafka.connect.mongodb.ChangeStreamOperations.createDro
 import static com.mongodb.kafka.connect.mongodb.ChangeStreamOperations.createDropDatabase;
 import static com.mongodb.kafka.connect.mongodb.ChangeStreamOperations.createInserts;
 import static com.mongodb.kafka.connect.source.schema.SchemaUtils.assertStructsEquals;
+import static com.mongodb.kafka.connect.util.jmx.internal.MBeanServerUtils.getMBeanAttributes;
 import static java.lang.String.format;
 import static java.util.Collections.singletonList;
 import static java.util.Collections.singletonMap;
@@ -376,6 +377,21 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
       insertMany(rangeClosed(1, 50), coll);
 
       assertSourceRecordValues(createInserts(1, 50), getNextResults(task), coll);
+
+      if (!isGreaterThanFourDotFour()) {
+        Map<String, Map<String, Long>> mBeansMap =
+            getMBeanAttributes(
+                "com.mongodb.kafka.connect:type=source-task-metrics,task=source-task-change-stream-unknown");
+        for (Map<String, Long> attrs : mBeansMap.values()) {
+          assertEquals(50, attrs.get("records"));
+          assertNotEquals(0, attrs.get("mongodb-bytes-read"));
+          assertNotEquals(0, attrs.get("initial-commands-successful"));
+          assertEquals(2, attrs.get("getmore-commands-successful"));
+          assertEquals(1, attrs.get("initial-commands-failed"));
+          assertEquals(0, attrs.get("getmore-commands-failed"));
+        }
+      }
+      task.stop();
     }
   }
 
@@ -447,7 +463,12 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
           .thenReturn(INVALID_OFFSET);
       task.initialize(context);
 
-      assertThrows(ConnectException.class, () -> task.start(cfg));
+      assertThrows(
+          ConnectException.class,
+          () -> {
+            task.start(cfg);
+            task.poll();
+          });
 
       assertTrue(
           task.logCapture.getEvents().stream()
@@ -459,6 +480,7 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
           task.logCapture.getEvents().stream()
               .anyMatch(e -> e.getRenderedMessage().contains("Failed to resume change stream")));
       task.logCapture.reset();
+      task.stop();
 
       when(offsetStorageReader.offset(singletonMap("ns", "newPartitionName"))).thenReturn(null);
       cfg.put(MongoSourceConfig.OFFSET_PARTITION_NAME_CONFIG, "newPartitionName");
@@ -473,6 +495,7 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
                   e ->
                       e.getRenderedMessage()
                           .contains("New change stream cursor created without offset")));
+      task.stop();
     }
   }
 
@@ -692,9 +715,7 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
               .filter(e -> e.getLevel().equals(Level.ERROR))
               .anyMatch(
                   e ->
-                      e.getMessage()
-                          .toString()
-                          .startsWith("Exception creating Source record for:")));
+                      e.getMessage().toString().contains("Exception creating Source record for:")));
 
       // Reset and test copy existing without logs
       task.stop();
@@ -712,7 +733,8 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
               .findFirst()
               .map(e -> e.getMessage().toString())
               .orElseGet(() -> "")
-              .startsWith("Exception creating Source record for:"));
+              .contains("Exception creating Source record for:"));
+      task.stop();
     }
   }
 
@@ -745,7 +767,7 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
       insertMany(rangeClosed(4, 5), coll);
 
       Exception e = assertThrows(DataException.class, () -> getNextResults(task));
-      assertTrue(e.getMessage().startsWith("Exception creating Source record for:"));
+      assertTrue(e.getMessage().contains("Exception creating Source record for:"));
     }
   }
 
@@ -789,6 +811,19 @@ public class MongoSourceTaskIntegrationTest extends MongoKafkaTestCase {
                           .toString()
                           .startsWith(
                               "Failed to resume change stream: Query failed with error code 10334")));
+
+      Map<String, Map<String, Long>> mBeansMap =
+          getMBeanAttributes(
+              "com.mongodb.kafka.connect:type=source-task-metrics,task=source-task-change-stream-unknown");
+      for (Map<String, Long> attrs : mBeansMap.values()) {
+        assertEquals(10, attrs.get("records"));
+        assertNotEquals(0, attrs.get("mongodb-bytes-read"));
+        assertEquals(2, attrs.get("initial-commands-successful"));
+        assertEquals(3, attrs.get("getmore-commands-successful"));
+        assertEquals(0, attrs.get("initial-commands-failed"));
+        assertEquals(1, attrs.get("getmore-commands-failed"));
+      }
+      task.stop();
     }
   }
 

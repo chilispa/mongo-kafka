@@ -31,6 +31,7 @@ import static com.mongodb.kafka.connect.source.producer.SchemaAndValueProducers.
 import static com.mongodb.kafka.connect.source.producer.SchemaAndValueProducers.createValueSchemaAndValueProvider;
 import static com.mongodb.kafka.connect.util.ConfigHelper.getMongoDriverInformation;
 import static com.mongodb.kafka.connect.util.ServerApiConfig.setServerApi;
+import static com.mongodb.kafka.connect.util.VisibleForTesting.AccessModifier.PRIVATE;
 import static java.lang.String.format;
 import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
@@ -44,9 +45,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.utils.SystemTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.connect.data.Schema;
@@ -74,12 +77,21 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import com.mongodb.event.CommandFailedEvent;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandSucceededEvent;
 
 import com.mongodb.kafka.connect.Versions;
 import com.mongodb.kafka.connect.source.MongoSourceConfig.OutputFormat;
 import com.mongodb.kafka.connect.source.heartbeat.HeartbeatManager;
 import com.mongodb.kafka.connect.source.producer.SchemaAndValueProducer;
 import com.mongodb.kafka.connect.source.topic.mapping.TopicMapper;
+import com.mongodb.kafka.connect.util.ResumeTokenUtils;
+import com.mongodb.kafka.connect.util.VisibleForTesting;
+import com.mongodb.kafka.connect.util.jmx.SourceTaskStatistics;
+import com.mongodb.kafka.connect.util.jmx.Timer;
+import com.mongodb.kafka.connect.util.jmx.internal.CombinedMongoMBean;
+import com.mongodb.kafka.connect.util.jmx.internal.MBeanServerUtils;
 
 /**
  * A Kafka Connect source task that uses change streams to broadcast changes to the collection,
@@ -142,6 +154,10 @@ public final class MongoSourceTask extends SourceTask {
   private static final String INVALID_RESUME_TOKEN = "invalid resume token";
   private static final String NO_LONGER_IN_THE_OPLOG = "no longer be in the oplog";
 
+  private static final String STREAM_BEAN = "source-task-change-stream";
+  private static final String COPY_BEAN = "source-task-copy-existing";
+  private static final String COMBINED_BEAN = "source-task";
+
   private final Time time;
   private final AtomicBoolean isRunning = new AtomicBoolean();
   private final AtomicBoolean isCopying = new AtomicBoolean();
@@ -158,6 +174,12 @@ public final class MongoSourceTask extends SourceTask {
   private BsonDocument cachedResumeToken;
 
   private MongoChangeStreamCursor<? extends BsonDocument> cursor;
+
+  private volatile SourceTaskStatistics currentStatistics;
+  private SourceTaskStatistics copyStatistics;
+  private SourceTaskStatistics streamStatistics;
+  private CombinedMongoMBean combinedStatistics;
+  private Timer lastTaskInvocation = null;
 
   public MongoSourceTask() {
     this(new SystemTime());
@@ -184,13 +206,30 @@ public final class MongoSourceTask extends SourceTask {
     partitionMap = null;
     createPartitionMap(sourceConfig);
 
+    CommandListener statisticsCommandListener =
+        new CommandListener() {
+          @Override
+          public void commandSucceeded(final CommandSucceededEvent event) {
+            mongoCommandSucceeded(event);
+          }
+
+          @Override
+          public void commandFailed(final CommandFailedEvent event) {
+            mongoCommandFailed(event);
+          }
+        };
+
     MongoClientSettings.Builder builder =
-        MongoClientSettings.builder().applyConnectionString(sourceConfig.getConnectionString());
+        MongoClientSettings.builder()
+            .applyConnectionString(sourceConfig.getConnectionString())
+            .addCommandListener(statisticsCommandListener);
     setServerApi(builder, sourceConfig);
     mongoClient =
         MongoClients.create(
             builder.build(),
             getMongoDriverInformation(CONNECTOR_TYPE, sourceConfig.getString(PROVIDER_CONFIG)));
+
+    initializeStatistics(shouldCopyData());
 
     if (shouldCopyData()) {
       setCachedResultAndResumeToken();
@@ -203,8 +242,52 @@ public final class MongoSourceTask extends SourceTask {
     LOGGER.info("Started MongoDB source task");
   }
 
+  @VisibleForTesting(otherwise = PRIVATE)
+  void initializeStatistics(final boolean shouldCopyData) {
+    copyStatistics = new SourceTaskStatistics(getMBeanName(COPY_BEAN));
+    streamStatistics = new SourceTaskStatistics(getMBeanName(STREAM_BEAN));
+    combinedStatistics =
+        new CombinedMongoMBean(getMBeanName(COMBINED_BEAN), copyStatistics, streamStatistics);
+    copyStatistics.register();
+    streamStatistics.register();
+    combinedStatistics.register();
+    if (shouldCopyData) {
+      currentStatistics = copyStatistics;
+    } else {
+      currentStatistics = streamStatistics;
+    }
+  }
+
+  private String getMBeanName(final String mBean) {
+    String id = MBeanServerUtils.taskIdFromCurrentThread();
+    return "com.mongodb.kafka.connect:type=source-task-metrics,task=" + mBean + "-" + id;
+  }
+
   @Override
   public List<SourceRecord> poll() {
+    if (!isCopying.get()) {
+      currentStatistics = streamStatistics;
+    }
+    if (lastTaskInvocation != null) {
+      currentStatistics
+          .getInConnectFramework()
+          .sample(lastTaskInvocation.getElapsedTime(TimeUnit.MILLISECONDS));
+    }
+    Timer taskTime = Timer.start();
+    List<SourceRecord> sourceRecords = pollInternal();
+    if (sourceRecords != null) {
+      currentStatistics.getRecords().sample(sourceRecords.size());
+    }
+    currentStatistics.getInTaskPoll().sample(taskTime.getElapsedTime(TimeUnit.MILLISECONDS));
+    lastTaskInvocation = Timer.start();
+
+    if (LOGGER.isDebugEnabled()) {
+      LOGGER.debug(currentStatistics.getName() + ": " + currentStatistics.toJSON());
+    }
+    return sourceRecords;
+  }
+
+  private List<SourceRecord> pollInternal() {
     final long startPoll = time.milliseconds();
     LOGGER.debug("Polling Start: {}", startPoll);
     List<SourceRecord> sourceRecords = new ArrayList<>();
@@ -239,7 +322,6 @@ public final class MongoSourceTask extends SourceTask {
             LOGGER.debug("Returning single heartbeat record");
             return singletonList(heartbeat.get());
           } else {
-            LOGGER.debug("Returning null because there is no heartbeat");
             return null;
           }
         }
@@ -272,8 +354,13 @@ public final class MongoSourceTask extends SourceTask {
         }
 
         valueDocument.ifPresent(
-            (valueDoc) -> {
+            (BsonDocument valueDoc) -> {
               LOGGER.trace("Adding {} to {}: {}", valueDoc, topicName, sourceOffset);
+
+              if (valueDoc instanceof RawBsonDocument) {
+                int sizeBytes = ((RawBsonDocument) valueDoc).getByteBuffer().limit();
+                currentStatistics.getMongodbBytesRead().sample(sizeBytes);
+              }
 
               BsonDocument keyDocument =
                   sourceConfig.getKeyOutputFormat() == OutputFormat.SCHEMA
@@ -332,8 +419,8 @@ public final class MongoSourceTask extends SourceTask {
       Supplier<String> errorMessage =
           () ->
               format(
-                  "Exception creating Source record for: Key=%s Value=%s",
-                  keyDocument.toJson(), valueDocument.toJson());
+                  "%s : Exception creating Source record for: Key=%s Value=%s",
+                  e.getMessage(), keyDocument.toJson(), valueDocument.toJson());
       if (sourceConfig.logErrors()) {
         LOGGER.error(errorMessage.get(), e);
       }
@@ -377,6 +464,10 @@ public final class MongoSourceTask extends SourceTask {
 
     supportsStartAfter = true;
     invalidatedCursor = false;
+
+    streamStatistics.unregister();
+    copyStatistics.unregister();
+    combinedStatistics.unregister();
   }
 
   void initializeCursorAndHeartbeatManager(
@@ -736,5 +827,45 @@ public final class MongoSourceTask extends SourceTask {
       }
     }
     return resumeToken;
+  }
+
+  @Override
+  public void commitRecord(final SourceRecord record, final RecordMetadata metadata) {
+    if (metadata == null) {
+      currentStatistics.getRecordsFiltered().sample(1);
+    } else {
+      currentStatistics.getRecordsAcknowledged().sample(1);
+    }
+  }
+
+  @VisibleForTesting(otherwise = PRIVATE)
+  void mongoCommandSucceeded(final CommandSucceededEvent event) {
+    String commandName = event.getCommandName();
+    long elapsedTimeMs = event.getElapsedTime(TimeUnit.MILLISECONDS);
+    if ("getMore".equals(commandName)) {
+      currentStatistics.getGetmoreCommandsSuccessful().sample(elapsedTimeMs);
+    } else if ("aggregate".equals(commandName) || "find".equals(commandName)) {
+      currentStatistics.getInitialCommandsSuccessful().sample(elapsedTimeMs);
+    }
+    ResumeTokenUtils.getResponseOffsetSecs(event.getResponse())
+        .ifPresent(offset -> currentStatistics.getLatestMongodbTimeDifferenceSecs().sample(offset));
+  }
+
+  @VisibleForTesting(otherwise = PRIVATE)
+  void mongoCommandFailed(final CommandFailedEvent event) {
+    Throwable e = event.getThrowable();
+    if (e instanceof MongoCommandException) {
+      if (doesNotSupportsStartAfter((MongoCommandException) e)) {
+        // silently ignore this expected exception, which is used to set this.supportsStartAfter
+        return;
+      }
+    }
+    String commandName = event.getCommandName();
+    long elapsedTimeMs = event.getElapsedTime(TimeUnit.MILLISECONDS);
+    if ("getMore".equals(commandName)) {
+      currentStatistics.getGetmoreCommandsFailed().sample(elapsedTimeMs);
+    } else if ("aggregate".equals(commandName) || "find".equals(commandName)) {
+      currentStatistics.getInitialCommandsFailed().sample(elapsedTimeMs);
+    }
   }
 }

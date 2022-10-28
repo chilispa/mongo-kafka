@@ -19,16 +19,22 @@ import static com.mongodb.kafka.connect.sink.MongoSinkConfig.TOPICS_CONFIG;
 import static com.mongodb.kafka.connect.sink.MongoSinkConfig.TOPICS_REGEX_CONFIG;
 import static com.mongodb.kafka.connect.sink.MongoSinkConfig.TOPIC_OVERRIDE_CONFIG;
 import static com.mongodb.kafka.connect.sink.MongoSinkTopicConfig.COLLECTION_CONFIG;
+import static com.mongodb.kafka.connect.util.jmx.internal.MBeanServerUtils.getMBeanAttributes;
+import static com.mongodb.kafka.connect.util.jmx.internal.MBeanServerUtils.getMBeanDescriptionFor;
 import static java.lang.String.format;
 import static java.util.Arrays.asList;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Random;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -47,6 +53,7 @@ import com.mongodb.client.model.Sorts;
 
 import com.mongodb.kafka.connect.avro.TweetMsg;
 import com.mongodb.kafka.connect.mongodb.MongoKafkaTestCase;
+import com.mongodb.kafka.connect.util.jmx.SinkTaskStatistics;
 
 class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
   private static final Random RANDOM = new Random();
@@ -59,6 +66,23 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
     addSinkConnector(topicName);
 
     assertProducesMessages(topicName, getCollectionName());
+    assertMetrics();
+
+    Map<String, Map<String, Long>> mBeansMap = getMBeanAttributes("com.mongodb.kafka.connect:*");
+    for (Map<String, Long> attrs : mBeansMap.values()) {
+      assertEventually(
+          () -> {
+            assertNotEquals(0, attrs.get("records"));
+            assertNotEquals(0, attrs.get("records-successful"));
+            assertEquals(0, attrs.get("records-failed"));
+            assertNotEquals(0, attrs.get("latest-kafka-time-difference-ms")); // potentially flaky
+            assertNotEquals(0, attrs.get("in-task-put"));
+            assertNotEquals(0, attrs.get("in-connect-framework"));
+            assertNotEquals(0, attrs.get("processing-phases"));
+            assertNotEquals(0, attrs.get("batch-writes-successful"));
+            assertEquals(0, attrs.get("batch-writes-failed"));
+          });
+    }
   }
 
   @Test
@@ -74,6 +98,7 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
 
     assertProducesMessages(topicName, getCollectionName());
     assertCollectionOrder(true);
+    assertMetrics();
   }
 
   @Test
@@ -86,6 +111,7 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
     addSinkConnector(topicName);
     assertProducesMessages(topicName, getCollectionName(), partitionCount);
     assertCollectionOrder(false);
+    assertMetrics();
   }
 
   @Test
@@ -102,6 +128,7 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
 
     assertProducesMessages(topicName, getCollectionName(), partitionCount);
     assertCollectionOrder(false);
+    assertMetrics();
   }
 
   @Test
@@ -130,6 +157,7 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
     assertProducesMessages(topicName2, collectionName2, partitionCount);
     assertCollectionOrder(collectionName1, true);
     assertCollectionOrder(collectionName2, false);
+    assertMetrics();
   }
 
   @Test
@@ -154,6 +182,7 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
 
     assertProducesMessages(topicName1, collectionName1);
     assertProducesMessages(topicName2, collectionName2);
+    assertMetrics();
   }
 
   @Test
@@ -163,6 +192,23 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
     KAFKA.createTopic(topicName);
     addSinkConnector(topicName);
     assertProducesMessages(topicName, getCollectionName(), true);
+    assertMetrics();
+  }
+
+  private void assertMetrics() {
+    Set<String> names = SinkTaskStatistics.DESCRIPTIONS.keySet();
+
+    String mBeanName = "com.mongodb.kafka.connect:type=sink-task-metrics,task=sink-task-0";
+    Map<String, Map<String, Long>> mBeansMap = getMBeanAttributes(mBeanName);
+    assertTrue(mBeansMap.size() > 0);
+    for (Map.Entry<String, Map<String, Long>> entry : mBeansMap.entrySet()) {
+      assertEquals(
+          names, entry.getValue().keySet(), "Mismatched MBean attributes for " + entry.getKey());
+      entry.getValue().keySet().forEach(n -> assertNotNull(getMBeanDescriptionFor(mBeanName, n)));
+    }
+    Set<String> initialNames = new HashSet<>();
+    new SinkTaskStatistics("name").emit(v -> initialNames.add(v.getName()));
+    assertEquals(names, initialNames, "Attributes must not be added after construction");
   }
 
   private void assertProducesMessages(final String topicName, final String collectionName) {
@@ -248,19 +294,18 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
     assertEventuallyEquals(expected, action, msg, 5, 1000);
   }
 
-  <T> void assertEventuallyEquals(
-      final T expected,
-      final Supplier<T> action,
-      final String msg,
-      final int retries,
-      final long timeoutMs) {
+  void assertEventually(final Runnable action) {
+    assertEventually(action, 5, 1000);
+  }
+
+  void assertEventually(final Runnable action, final int retries, final long timeoutMs) {
     int counter = 0;
     boolean hasError = true;
     AssertionFailedError exception = null;
     while (counter < retries && hasError) {
       try {
         counter++;
-        assertEquals(expected, action.get(), msg);
+        action.run();
         hasError = false;
       } catch (AssertionFailedError e) {
         LOGGER.debug("Failed assertion on attempt: {}", counter);
@@ -275,6 +320,15 @@ class MongoSinkConnectorIntegrationTest extends MongoKafkaTestCase {
     if (hasError && exception != null) {
       throw exception;
     }
+  }
+
+  <T> void assertEventuallyEquals(
+      final T expected,
+      final Supplier<T> action,
+      final String msg,
+      final int retries,
+      final long timeoutMs) {
+    this.assertEventually(() -> assertEquals(expected, action.get(), msg), retries, timeoutMs);
   }
 
   private void assertCollectionOrder(final boolean exact) {

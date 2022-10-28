@@ -39,7 +39,7 @@ plugins {
 }
 
 group = "org.mongodb.kafka"
-version = "1.8.0-SNAPSHOT"
+version = "1.9.0-SNAPSHOT"
 description = "The official MongoDB Apache Kafka Connect Connector."
 
 repositories {
@@ -49,7 +49,7 @@ repositories {
 }
 
 extra.apply {
-    set("mongodbDriverVersion", "[4.5,4.5.99)")
+    set("mongodbDriverVersion", "[4.7,4.7.99)")
     set("kafkaVersion", "2.6.0")
     set("avroVersion", "1.9.2")
 
