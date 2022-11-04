@@ -98,7 +98,7 @@ public class MongoMBean implements DynamicMBean {
     AttributeList list = new AttributeList();
     for (String name : attributes) {
       if (metricsMap.containsKey(name)) {
-        list.add(metricsMap.get(name).get());
+        list.add(new Attribute(name, metricsMap.get(name).get()));
       }
     }
     return list;
