@@ -74,7 +74,11 @@ public final class StartedMongoSinkTask {
 
   private String getMBeanName() {
     String id = MBeanServerUtils.taskIdFromCurrentThread();
-    return "com.mongodb.kafka.connect:type=sink-task-metrics,task=sink-task-" + id;
+    return "com.mongodb.kafka.connect:type=sink-task-metrics"
+        + ",topics="
+        + sinkConfig.getTopics().map(l -> String.join(",", l)).orElse("null")
+        + ",task=sink-task-"
+        + id;
   }
 
   /** @see MongoSinkTask#stop() */

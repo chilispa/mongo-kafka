@@ -261,7 +261,17 @@ public final class MongoSourceTask extends SourceTask {
 
   private String getMBeanName(final String mBean) {
     String id = MBeanServerUtils.taskIdFromCurrentThread();
-    return "com.mongodb.kafka.connect:type=source-task-metrics,task=" + mBean + "-" + id;
+    String database = sourceConfig.getString(DATABASE_CONFIG);
+    String collection = sourceConfig.getString(COLLECTION_CONFIG);
+    return "com.mongodb.kafka.connect:type=source-task-metrics"
+        + ",database="
+        + database
+        + ",collection="
+        + collection
+        + ",task="
+        + mBean
+        + "-"
+        + id;
   }
 
   @Override
